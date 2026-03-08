@@ -710,7 +710,7 @@ def replace_and_evaluate(
               "module": str,
               "file_path": str,
               "timestamp": str,            # ISO 格式时间戳
-              "backup_path": str | null,   # 备份文件路径
+              "backup_path": str | null,   # 备份文件路径（替换前自动生成）
               "replacement": {
                 "status": "replaced" | "failed",
                 "syntax_valid": bool,
@@ -718,16 +718,35 @@ def replace_and_evaluate(
                 "is_implemented": bool,    # 新实现是否已非存根
                 "error": str | null
               },
-              "performance": {
-                "mode": str,               # 评估模式
+              "baseline_performance": {    # 替换前的原始函数性能（基线）
+                "mode": str,
+                "val_L2_relative": float | null,
+                "call_time_seconds": float | null,
+                ...
+              },
+              "performance": {             # 替换后的新函数性能
+                "mode": str,
                 "val_L2_relative": float | null,
                 "pde_loss": float | null,
                 "bc_loss": float | null,
                 "call_time_seconds": float | null,
                 "return_summary": str | null,
                 "error": str | null
+              },
+              "performance_delta": {       # 新 - 基线（负值 = 改善）
+                "val_L2_relative": float | null,
+                "call_time_seconds": float | null,
+                "note": str               # 解释 delta 为 0 的可能原因
               }
             }
+
+        重要说明：
+          - "training_eval" 模式评估的是整个原始模型（model_darcy.py 等），
+            lib/optimizations/ 里的函数当前尚未插入模型 forward 流程。
+            因此除非已将此优化函数接入模型，否则 delta.val_L2_relative == 0，
+            baseline == performance，这是正确行为而非 bug。
+          - "call_test" 模式直接调用替换后的函数，delta 反映单次调用耗时变化，
+            是最直接衡量被替换函数本身性能的模式。
 
     Raises:
         ValueError: 若 target 无法解析为已知优化函数。
@@ -815,8 +834,12 @@ def replace_and_evaluate(
             },
         }
 
-    # ── 3. 备份原文件 ──────────────────────────────────────────────────────────
+    # ── 3. 备份原文件，并在替换前跑一次基线评估 ──────────────────────────────
     backup_path = _backup_file(file_path)
+
+    # 基线评估：此时文件内容仍为原始实现（含 NotImplementedError 存根）
+    # call_test / training_eval 模式下均先测原始函数行为作为对照
+    baseline_perf = _quick_eval(func_name, module_name, eval_config)
 
     # ── 4. 替换函数 ────────────────────────────────────────────────────────────
     try:
@@ -840,8 +863,9 @@ def replace_and_evaluate(
                 "is_implemented": False,
                 "error": f"写文件失败: {e}",
             },
+            "baseline_performance": baseline_perf,
             "performance": {
-                "mode": "import_only",
+                "mode": eval_config.get("mode", "import_only") if eval_config else "import_only",
                 "val_L2_relative": None,
                 "pde_loss": None,
                 "bc_loss": None,
@@ -849,6 +873,7 @@ def replace_and_evaluate(
                 "return_summary": None,
                 "error": "未执行，替换失败。",
             },
+            "performance_delta": None,
         }
 
     # ── 5. 重新导入模块，检查 import 是否正常 ────────────────────────────────
@@ -871,8 +896,9 @@ def replace_and_evaluate(
                 "is_implemented": not validation.get("is_stub", True),
                 "error": reload_result["error"],
             },
+            "baseline_performance": baseline_perf,
             "performance": {
-                "mode": "import_only",
+                "mode": eval_config.get("mode", "import_only") if eval_config else "import_only",
                 "val_L2_relative": None,
                 "pde_loss": None,
                 "bc_loss": None,
@@ -880,10 +906,24 @@ def replace_and_evaluate(
                 "return_summary": None,
                 "error": "未执行，模块导入失败，原文件已恢复。",
             },
+            "performance_delta": None,
         }
 
-    # ── 6. 性能评估 ────────────────────────────────────────────────────────────
+    # ── 6. 替换后性能评估，并与基线做差 ──────────────────────────────────────
     perf = _quick_eval(func_name, module_name, eval_config)
+
+    # 计算 val_L2_relative 的 delta（负值 = 改善；正值 = 退化）
+    delta_val_L2 = None
+    b_val = baseline_perf.get("val_L2_relative")
+    n_val = perf.get("val_L2_relative")
+    if b_val is not None and n_val is not None:
+        delta_val_L2 = round(n_val - b_val, 8)
+
+    delta_time = None
+    b_t = baseline_perf.get("call_time_seconds")
+    n_t = perf.get("call_time_seconds")
+    if b_t is not None and n_t is not None:
+        delta_time = round(n_t - b_t, 8)
 
     return {
         "success": True,
@@ -900,5 +940,17 @@ def replace_and_evaluate(
             "is_implemented": not validation.get("is_stub", True),
             "error": None,
         },
+        "baseline_performance": baseline_perf,
         "performance": perf,
+        "performance_delta": {
+            "val_L2_relative": delta_val_L2,
+            "call_time_seconds": delta_time,
+            "note": (
+                "负值表示改善（误差降低/速度提升）。"
+                " training_eval 模式下 delta=0 意味着被替换的函数尚未插入原始模型"
+                "（model_darcy.py/model_plate.py），整体性能不受影响——"
+                "需先将此优化函数接入模型 forward 才能观察到有意义的 delta。"
+                " call_test 模式下 delta 反映单次函数调用耗时变化。"
+            ),
+        },
     }
