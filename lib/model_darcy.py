@@ -2,6 +2,23 @@ import torch
 import torch.nn as nn
 import math
 
+from .model_darcy_optimizable import (
+    build_geometry_mlp,
+    encode_geometry_positions,
+    apply_geometry_interaction,
+    aggregate_geometry_features,
+    build_parameter_mlp,
+    apply_parameter_interaction,
+    aggregate_parameter_features,
+    cross_attend_geo_param,
+    build_coordinate_encoder,
+    inject_global_info,
+    create_activation,
+    build_prediction_head_layers,
+    modulate_features,
+    aggregate_output,
+)
+
 ''' ------------------------- baselines -------------------------- '''
 
 # physics-informed DCON
@@ -156,29 +173,22 @@ class DG(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        # branch network
-        trunk_layers = [nn.Linear(2, config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(config['model']['fc_dim'], config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
-        
+        # branch network [B1/B2/B5: build_geometry_mlp]
+        self.branch = build_geometry_mlp(2, config['model']['fc_dim'], config['model']['N_layer'])
+
     def forward(self, shape_coor, shape_flag):
         '''
-        par: (B, M', 3)
-        par_flag: (B, M')
-        x_coor: (B, M)
-        y_coor: (B, M)
-        z_coor: (B, M)
+        shape_coor: (B, M'', 2)
+        shape_flag: (B, M'')
 
-        return u: (B, M)
+        return Domain_enc: (B, 1, F)
         '''
 
         # get the first kernel
-        enc = self.branch(shape_coor)    # (B, M, F)
-        enc_masked = enc * shape_flag.unsqueeze(-1)    # (B, M, F)
-        Domain_enc = torch.sum(enc_masked, 1, keepdim=True) / torch.sum(shape_flag.unsqueeze(-1), 1, keepdim=True)    # (B, 1, F)
+        shape_input = encode_geometry_positions(shape_coor)               # [B6] (B, M'', 2)
+        enc = self.branch(shape_input)                                     # (B, M'', F)
+        enc = apply_geometry_interaction(enc, shape_flag)                  # [B4] (B, M'', F)
+        Domain_enc = aggregate_geometry_features(enc, shape_flag)          # [B3] (B, 1, F)
 
         return Domain_enc
 
@@ -190,29 +200,24 @@ class PI_GANO(nn.Module):
         # define the geometry encoder
         self.DG = DG(config)
 
-        # branch network
-        trunk_layers = [nn.Linear(3, 2*config['model']['fc_dim']), nn.Tanh()]
-        for _ in range(config['model']['N_layer'] - 1):
-            trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-            trunk_layers.append(nn.Tanh())
-        trunk_layers.append(nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim']))
-        self.branch = nn.Sequential(*trunk_layers)
+        # branch network [C1/C4: build_parameter_mlp]
+        self.branch = build_parameter_mlp(3, 2*config['model']['fc_dim'], config['model']['N_layer'])
 
-        # trunk network 1
-        self.xy_lift = nn.Linear(2, config['model']['fc_dim'])
-        self.FC1u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC2u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC3u = nn.Linear(2*config['model']['fc_dim'], 2*config['model']['fc_dim'])
-        self.FC4u = nn.Linear(2*config['model']['fc_dim'], 1)
-        self.act = nn.Tanh()
-        
+        # coordinate encoder [D1: build_coordinate_encoder]
+        self.xy_lift = build_coordinate_encoder(config['model']['fc_dim'])
+
+        # prediction head [E7: build_prediction_head_layers, E5: create_activation]
+        self.FC1u, self.FC2u, self.FC3u, self.FC4u = build_prediction_head_layers(config['model']['fc_dim'])
+        self.act = create_activation()
+
     def forward(self, x_coor, y_coor, par, par_flag, shape_coor, shape_flag):
         '''
         par: (B, M', 3)
         par_flag: (B, M')
         x_coor: (B, M)
         y_coor: (B, M)
-        z_coor: (B, M)
+        shape_coor: (B, M'', 2)
+        shape_flag: (B, M'')
 
         return u: (B, M)
         '''
@@ -226,27 +231,28 @@ class PI_GANO(nn.Module):
         # concat coors
         xy = torch.cat((x_coor.unsqueeze(-1), y_coor.unsqueeze(-1)), -1)
 
-        # lift the dimension of coordinate embedding
+        # lift the dimension of coordinate embedding [D1]
         xy_local = self.xy_lift(xy)   # (B,M,F)
 
-        # combine with global embedding
-        xy_global = torch.cat((xy_local, Domain_enc.repeat(1,mD,1)), -1)    # (B,M,2F)
+        # combine with global embedding [D3: inject_global_info]
+        xy_global = inject_global_info(xy_local, Domain_enc, mD)    # (B,M,2F)
 
-        # get the kernels
-        enc = self.branch(par)    # (B, M, F)
-        enc_masked = enc * par_flag.unsqueeze(-1)    # (B, M, F)
-        enc = torch.amax(enc_masked, 1, keepdim=True)    # (B, 1, F)
+        # get the kernels [C3: apply_parameter_interaction, C5: cross_attend, C2: aggregate]
+        enc = self.branch(par)                                         # (B, M', 2F)
+        enc = apply_parameter_interaction(enc, par_flag)               # [C3] (B, M', 2F)
+        Domain_enc, enc = cross_attend_geo_param(Domain_enc, enc)      # [C5] no-op
+        enc = aggregate_parameter_features(enc, par_flag)              # [C2] (B, 1, 2F)
 
-        # predict u
-        u = self.FC1u(xy_global)   # (B,M,F)
+        # predict u [E1: modulate_features, E4: aggregate_output]
+        u = self.FC1u(xy_global)   # (B,M,2F)
         u = self.act(u)
-        u = u * enc
-        u = self.FC2u(u)   # (B,M,F)
+        u = modulate_features(u, enc)                                  # [E1]
+        u = self.FC2u(u)   # (B,M,2F)
         u = self.act(u)
-        u = u * enc
-        u = self.FC3u(u)   # (B,M,F)
-        u = torch.mean(u * enc, -1)    # (B, M)
-        
+        u = modulate_features(u, enc)                                  # [E1]
+        u = self.FC3u(u)   # (B,M,2F)
+        u = aggregate_output(u, enc)                                   # [E4] (B, M)
+
         return u
 
 ''' ------------------------- study of geometry embedding -------------------------- '''

@@ -2,6 +2,15 @@ import scipy.io as sio
 import numpy as np
 import torch
 
+from .utils_data_optimizable import (
+    normalize_coordinates,
+    scale_young_modulus,
+    normalize_bc_parameters,
+    create_padding,
+    compute_dataset_split,
+    augment_sample,
+)
+
 # function to generate data loader for darcy problem 
 def generate_darcy_data_loader(args, config):
 
@@ -48,17 +57,17 @@ def generate_darcy_data_loader(args, config):
         num_bc = np.size(bc_idx)
         # re-organize solution
         up = u[i]
-        up = np.concatenate((up[:,pde_idx], np.zeros((1,max_pde_nodes-num_pde)), up[:,bc_idx], np.zeros((1,max_bc_nodes-num_bc))), -1)    # (1, max_pde+max_bc)
+        up = np.concatenate((up[:,pde_idx], create_padding((1,max_pde_nodes-num_pde)), up[:,bc_idx], create_padding((1,max_bc_nodes-num_bc))), -1)    # [A3] (1, max_pde+max_bc)
         uT.append(up)
-        # re-organize coors
-        coorp = coors[i]
-        coorp = np.concatenate((coorp[pde_idx,:], np.zeros((max_pde_nodes-num_pde,2)), coorp[bc_idx,:], np.zeros((max_bc_nodes-num_bc,2))), 0)    # (max_pde+max_bc,2)
+        # re-organize coors [A1: normalize_coordinates]
+        coorp = normalize_coordinates(coors[i])
+        coorp = np.concatenate((coorp[pde_idx,:], create_padding((max_pde_nodes-num_pde,2)), coorp[bc_idx,:], create_padding((max_bc_nodes-num_bc,2))), 0)    # [A3] (max_pde+max_bc,2)
         coorp = np.expand_dims(coorp, 0)    # (1,max_pde+max_bc,2)
-        coorT.append(coorp) 
-        # re-organize parameters
-        parpv = par[i]
+        coorT.append(coorp)
+        # re-organize parameters [A2: normalize_bc_parameters]
+        parpv = normalize_bc_parameters(par[i])
         num_par = parpv.shape[0]
-        parp = np.concatenate((parpv, np.zeros((max_par_nodes-num_par,3))), 0)    # (max_par,3)
+        parp = np.concatenate((parpv, create_padding((max_par_nodes-num_par,3))), 0)    # [A3] (max_par,3)
         par_flag = np.concatenate((np.ones_like(parpv), np.zeros((max_par_nodes-num_par,3))), 0)    # (max_par,3)
         parp = np.expand_dims(parp, 0)    # (1,max_par,3)
         par_flag = np.expand_dims(par_flag, 0)    # (1,max_par,3)
@@ -79,10 +88,8 @@ def generate_darcy_data_loader(args, config):
     flagT = torch.from_numpy(flagT)
     par_flagT = torch.from_numpy(par_flagT)
 
-    # split the data
-    bar1 = [0,int(0.7*datasize)]
-    bar2 = [int(0.7*datasize),int(0.8*datasize)]
-    bar3 = [int(0.8*datasize),int(datasize)]
+    # split the data [A4: compute_dataset_split]
+    bar1, bar2, bar3 = compute_dataset_split(datasize)
     train_dataset = torch.utils.data.TensorDataset(parT[bar1[0]:bar1[1],:,:],
             coorT[bar1[0]:bar1[1],:], uT[bar1[0]:bar1[1],:], flagT[bar1[0]:bar1[1],:], par_flagT[bar1[0]:bar1[1],:])
     val_dataset = torch.utils.data.TensorDataset(parT[bar2[0]:bar2[1],:,:], 
@@ -113,9 +120,8 @@ def generate_plate_stress_data_loader(args, config):
     young = mat_contents['young'][0][0]   # scalar
     element_size = mat_contents['element_size'][0][0]   # scalar
 
-    # scale the young's module
-    scalar_factor = 1e-4
-    young = young * scalar_factor
+    # scale the young's module [A2: scale_young_modulus]
+    young = scale_young_modulus(young, scalar_factor=1e-4)
 
     '''
     prepare the data to support batchwise training
@@ -173,39 +179,39 @@ def generate_plate_stress_data_loader(args, config):
         num_bcy = np.size(bcy_idx)
         num_bcxy = np.size(bcxy_idx)
 
-        # re-organize solution
+        # re-organize solution [A3: create_padding]
         up = u[i]
         up = np.concatenate((
-                            up[pde_idx,:], np.zeros((max_pde_nodes-num_pde,1)), 
-                            up[bc_load_idx,:], np.zeros((max_par_nodes-num_load,1)),
-                            up[bcy_idx,:], np.zeros((max_bcy_nodes-num_bcy,1)),
-                            up[bcxy_idx,:], np.zeros((max_bcxy_nodes-num_bcxy,1))
+                            up[pde_idx,:], create_padding((max_pde_nodes-num_pde,1)),
+                            up[bc_load_idx,:], create_padding((max_par_nodes-num_load,1)),
+                            up[bcy_idx,:], create_padding((max_bcy_nodes-num_bcy,1)),
+                            up[bcxy_idx,:], create_padding((max_bcxy_nodes-num_bcxy,1))
                             ), 0)    # (max_pde+max_load+max_bcy+max_bcxy,1)
         uT.append(up)
         vp = v[i]
         vp = np.concatenate((
-                            vp[pde_idx,:], np.zeros((max_pde_nodes-num_pde,1)), 
-                            vp[bc_load_idx,:], np.zeros((max_par_nodes-num_load,1)),
-                            vp[bcy_idx,:], np.zeros((max_bcy_nodes-num_bcy,1)),
-                            vp[bcxy_idx,:], np.zeros((max_bcxy_nodes-num_bcxy,1))
+                            vp[pde_idx,:], create_padding((max_pde_nodes-num_pde,1)),
+                            vp[bc_load_idx,:], create_padding((max_par_nodes-num_load,1)),
+                            vp[bcy_idx,:], create_padding((max_bcy_nodes-num_bcy,1)),
+                            vp[bcxy_idx,:], create_padding((max_bcxy_nodes-num_bcxy,1))
                             ), 0)    # (max_pde+max_load+max_bcy+max_bcxy,1)
         vT.append(vp)
 
-        # re-organize coors
-        coorp = coors[i]
+        # re-organize coors [A1: normalize_coordinates, A3: create_padding]
+        coorp = normalize_coordinates(coors[i])
         coorp = np.concatenate((
-                            coorp[pde_idx,:], np.zeros((max_pde_nodes-num_pde,2)), 
-                            coorp[bc_load_idx,:], np.zeros((max_par_nodes-num_load,2)),
-                            coorp[bcy_idx,:], np.zeros((max_bcy_nodes-num_bcy,2)),
-                            coorp[bcxy_idx,:], np.zeros((max_bcxy_nodes-num_bcxy,2))
-                            ), 0)    # (max_pde+max_load+max_bcy+max_bcxy,2)  
-        coorp = np.expand_dims(coorp, 0)    # (1, max_pde+max_load+max_bcy+max_bcxy,2) 
-        coorT.append(coorp) 
+                            coorp[pde_idx,:], create_padding((max_pde_nodes-num_pde,2)),
+                            coorp[bc_load_idx,:], create_padding((max_par_nodes-num_load,2)),
+                            coorp[bcy_idx,:], create_padding((max_bcy_nodes-num_bcy,2)),
+                            coorp[bcxy_idx,:], create_padding((max_bcxy_nodes-num_bcxy,2))
+                            ), 0)    # (max_pde+max_load+max_bcy+max_bcxy,2)
+        coorp = np.expand_dims(coorp, 0)    # (1, max_pde+max_load+max_bcy+max_bcxy,2)
+        coorT.append(coorp)
 
-        # re-organize parameters
-        parpv = par[i]
+        # re-organize parameters [A2: normalize_bc_parameters, A3: create_padding]
+        parpv = normalize_bc_parameters(par[i])
         num_par = parpv.shape[0]
-        parp = np.concatenate((parpv, np.zeros((max_par_nodes-num_par,4))), 0)    # (max_par,4)
+        parp = np.concatenate((parpv, create_padding((max_par_nodes-num_par,4))), 0)    # (max_par,4)
         par_flag = np.concatenate((np.ones_like(parpv), np.zeros((max_par_nodes-num_par,4))), 0)    # (max_par,4)
         parp = np.expand_dims(parp, 0)    # (1,max_par,4)
         par_flag = np.expand_dims(par_flag, 0)    # (1,max_par,4)
@@ -238,10 +244,8 @@ def generate_plate_stress_data_loader(args, config):
 
     print(uT.shape, vT.shape, coorT.shape, parT.shape, flagT.shape, par_flagT.shape)
 
-    # split the data
-    bar1 = [0,int(0.7*datasize)]
-    bar2 = [int(0.7*datasize),int(0.8*datasize)]
-    bar3 = [int(0.8*datasize),int(datasize)]
+    # split the data [A4: compute_dataset_split]
+    bar1, bar2, bar3 = compute_dataset_split(datasize)
     train_dataset = torch.utils.data.TensorDataset(
         parT[bar1[0]:bar1[1],:,:],coorT[bar1[0]:bar1[1],:], 
         uT[bar1[0]:bar1[1],:], vT[bar1[0]:bar1[1],:],

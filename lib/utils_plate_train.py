@@ -7,6 +7,15 @@ from torch.autograd import Variable
 import torch.optim as optim
 
 from .utils_losses import plate_stress_loss, bc_edgeY_loss
+from .utils_losses_optimizable import compute_total_loss_plate, apply_gradient_clipping
+from .utils_plate_train_optimizable import (
+    sample_pde_indices,
+    create_lr_scheduler,
+    create_optimizer,
+    check_early_stopping,
+    get_geo_node_index,
+    get_curriculum_loader,
+)
 
 # plotting function
 def plot(xcoor, ycoor, f):
@@ -27,12 +36,7 @@ def val(model, loader, args, device, num_nodes_list):
     for (par, coors, u, v, flag, par_flag) in loader:
 
         # extract domain shape information
-        if args.geo_node == 'vary_bound' or 'vary_bound_sup':
-            ss_index = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_bound':
-            ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_domain':
-            ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+        ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_par_nodes, max_bcy_nodes, max_bcxy_nodes)    # [G5]
         shape_coors = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
         shape_flag = flag[:, ss_index]
         shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -73,12 +77,7 @@ def test(model, loader, args, device, num_nodes_list, dir):
     for (par, coors, u, v, flag, par_flag) in loader:
 
         # extract domain shape information
-        if args.geo_node == 'vary_bound' or 'vary_bound_sup':
-            ss_index = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_bound':
-            ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_domain':
-            ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+        ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_par_nodes, max_bcy_nodes, max_bcxy_nodes)    # [G5]
         shape_coors = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
         shape_flag = flag[:, ss_index]
         shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -197,12 +196,7 @@ def get_geometry_embeddings(model, loader, args, device, num_nodes_list):
     for (par, coors, u, v, flag, par_flag) in loader:
 
         # extract domain shape information
-        if args.geo_node == 'vary_bound' or 'vary_bound_sup':
-            ss_index = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_bound':
-            ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-        if args.geo_node == 'all_domain':
-            ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+        ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_par_nodes, max_bcy_nodes, max_bcxy_nodes)    # [G5]
         shape_coors = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
         shape_flag = flag[:, ss_index]
         shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -243,9 +237,10 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
     pbar = range(config['train']['epochs'])
     pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
 
-    # define optimizer and loss
+    # define optimizer and loss [G3: create_optimizer, G2: create_lr_scheduler]
     mse = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    optimizer = create_optimizer(model, config)
+    scheduler = create_lr_scheduler(optimizer, config)    # [G2] currently None
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -255,9 +250,9 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
 
     # move the model to the defined device
     try:
-        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model)))  
+        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model)))
     except:
-        print('No trained models') 
+        print('No trained models')
     model = model.to(device)
 
     # define tradeoff weights
@@ -296,12 +291,13 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
 
             # train one epoch
             model.train()
-            for (par, coors, u, v, flag, par_flag) in train_loader:
+            epoch_loader = get_curriculum_loader(e, train_loader, config)    # [G6]
+            for (par, coors, u, v, flag, par_flag) in epoch_loader:
 
                 for _ in range(config['train']['coor_sampling_freq']):
 
-                    # random sampling for PDE residual computation
-                    ss_index = np.random.choice(np.arange(max_pde_nodes), config['train']['coor_sampling_size'])
+                    # random sampling for PDE residual computation [G1: sample_pde_indices]
+                    ss_index = sample_pde_indices(max_pde_nodes, config['train']['coor_sampling_size'])
                     pde_sampled_coors = coors[:, ss_index, :]
                     pde_sampled_coors = pde_sampled_coors.float().to(device)    # (B, Ms, 2)
                     pde_flag = flag[:, ss_index]
@@ -328,12 +324,7 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
                     bcxy_flag = bcxy_flag.float().to(device)    # (B, max_bcxy)
 
                     # extract the boundary of the varying shape
-                    if args.geo_node == 'vary_bound' or 'vary_bound_sup':
-                        ss_index = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-                    if args.geo_node == 'all_bound':
-                        ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-                    if args.geo_node == 'all_domain':
-                        ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+                    ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_par_nodes, max_bcy_nodes, max_bcxy_nodes)    # [G5]
                     shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
                     shape_flag = flag[:, ss_index]
                     shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -365,7 +356,10 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
                     load_loss = mse(u_load_pred*load_flag, u_load_gt*load_flag) + mse(v_load_pred*load_flag, v_load_gt*load_flag)
                     fix_loss = torch.mean((u_BCxy_pred*bcxy_flag)**2) + torch.mean((v_BCxy_pred*bcxy_flag)**2)
                     free_loss = torch.mean((sigma_yy*bcy_flag)**2) + torch.mean((sigma_xy*bcy_flag)**2)
-                    total_loss = weight_pde*pde_loss + weight_load*load_loss + weight_fix*fix_loss + weight_free*free_loss
+                    total_loss = compute_total_loss_plate(    # [F4]
+                        pde_loss, load_loss, fix_loss, free_loss,
+                        weight_pde, weight_load, weight_fix, weight_free,
+                    )
 
                     # store the loss
                     avg_pde_loss += pde_loss.detach().cpu().item()
@@ -373,9 +367,10 @@ def train(args, config, model, device, loaders, num_nodes_list, params):
                     avg_free_loss = free_loss.detach().cpu().item()
                     avg_load_loss = load_loss.detach().cpu().item()
 
-                    # update parameter
+                    # update parameter [F5: apply_gradient_clipping]
                     optimizer.zero_grad()
                     total_loss.backward()
+                    apply_gradient_clipping(model)
                     optimizer.step()
 
                     # clear cuda

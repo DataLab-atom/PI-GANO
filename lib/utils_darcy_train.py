@@ -7,6 +7,15 @@ import torch.nn as nn
 from torch.autograd import Variable
 
 from .utils_losses import darcy_loss
+from .utils_losses_optimizable import compute_total_loss, apply_gradient_clipping
+from .utils_darcy_train_optimizable import (
+    sample_pde_indices,
+    create_lr_scheduler,
+    create_optimizer,
+    check_early_stopping,
+    get_geo_node_index,
+    get_curriculum_loader,
+)
 
 # plotting function
 def plot(xcoor, ycoor, f):
@@ -32,10 +41,7 @@ def val(model, loader, device, args, num_nodes_list):
         u = u.float().to(device)
 
         # extract shape coordinates
-        if args.geo_node == 'vary_bound' or 'vary_bound_sup': 
-            ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_bc_nodes)
-        if args.geo_node == 'all_domain':
-            ss_index = np.arange(0, max_pde_nodes + max_bc_nodes)
+        ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_bc_nodes)    # [G5]
         shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
         shape_flag = flag[:, ss_index]
         shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -73,10 +79,7 @@ def test(model, loader, device, args, num_nodes_list):
         flag = flag.float().to(device)
 
         # extract shape coordinates
-        if args.geo_node == 'vary_bound' or 'vary_bound_sup': 
-            ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_bc_nodes)
-        if args.geo_node == 'all_domain':
-            ss_index = np.arange(0, max_pde_nodes + max_bc_nodes)
+        ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_bc_nodes)    # [G5]
         shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
         shape_flag = flag[:, ss_index]
         shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
@@ -182,9 +185,10 @@ def train(args, config, model, device, loaders, num_nodes_list):
     pbar = range(config['train']['epochs'])
     pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
 
-    # define optimizer and loss
+    # define optimizer and loss [G3: create_optimizer, G2: create_lr_scheduler]
     mse = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    optimizer = create_optimizer(model, config)
+    scheduler = create_lr_scheduler(optimizer, config)    # [G2] currently None
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -194,9 +198,9 @@ def train(args, config, model, device, loaders, num_nodes_list):
 
     # move the model to the defined device
     try:
-        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model), map_location=device))  
+        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model), map_location=device))
     except:
-        print('No trained models') 
+        print('No trained models')
     model = model.to(device)
 
     # define tradeoff weights
@@ -225,12 +229,13 @@ def train(args, config, model, device, loaders, num_nodes_list):
 
             # train one epoch
             model.train()
-            for (par, coors, u, flag, par_flag) in train_loader:
+            epoch_loader = get_curriculum_loader(e, train_loader, config)    # [G6]
+            for (par, coors, u, flag, par_flag) in epoch_loader:
 
                 for _ in range(config['train']['coor_sampling_freq']):
 
-                    # random sampling for PDE residual computation
-                    ss_index = np.random.choice(np.arange(max_pde_nodes), config['train']['coor_sampling_size'])
+                    # random sampling for PDE residual computation [G1: sample_pde_indices]
+                    ss_index = sample_pde_indices(max_pde_nodes, config['train']['coor_sampling_size'])
                     pde_sampled_coors = coors[:, ss_index, :]
                     pde_sampled_coors = pde_sampled_coors.float().to(device)
                     pde_flag = flag[:, ss_index]
@@ -249,35 +254,33 @@ def train(args, config, model, device, loaders, num_nodes_list):
                     par = par.float().to(device)
                     par_flag = par_flag.float().to(device)
 
-                    # prepare the shape coordinate input
-                    if args.geo_node == 'vary_bound' or 'vary_bound_sup': 
-                        ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_bc_nodes)
-                    if args.geo_node == 'all_domain':
-                        ss_index = np.arange(0, max_pde_nodes + max_bc_nodes)
+                    # prepare the shape coordinate input [G5: get_geo_node_index]
+                    ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_bc_nodes)
                     shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
                     shape_flag = flag[:, ss_index]
                     shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
 
                     # forward to get the prediction on fixed boundary
                     u_BC_pred = model(bc_coors[:,:,0], bc_coors[:,:,1], par, par_flag, shape_coor, shape_flag)
-                    
+
                     # forward to get the prediction on pde domian
                     x_pde = Variable(pde_sampled_coors[:,:,0], requires_grad=True)
                     y_pde = Variable(pde_sampled_coors[:,:,1], requires_grad=True)
                     u_pde_pred = model(x_pde, y_pde, par, par_flag, shape_coor, shape_flag)
 
-                    # compute the losses
+                    # compute the losses [F4: compute_total_loss]
                     pde_loss = darcy_loss(u_pde_pred, x_pde, y_pde, pde_flag)
                     bc_loss = mse(u_BC_pred*bc_flag, u_BC_gt*bc_flag)
-                    total_loss = weight_pde*pde_loss + weight_bc*bc_loss
+                    total_loss = compute_total_loss(pde_loss, bc_loss, weight_pde, weight_bc)
 
                     # store the loss
                     avg_pde_loss += pde_loss.detach().cpu().item()
                     avg_bc_loss += bc_loss.detach().cpu().item()
 
-                    # update parameter
+                    # update parameter [F5: apply_gradient_clipping]
                     optimizer.zero_grad()
                     total_loss.backward()
+                    apply_gradient_clipping(model)
                     optimizer.step()
 
     # final test
@@ -305,9 +308,10 @@ def sup_train(args, config, model, device, loaders, num_nodes_list):
     pbar = range(config['train']['epochs'])
     pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
 
-    # define optimizer and loss
+    # define optimizer and loss [G3: create_optimizer, G2: create_lr_scheduler]
     mse = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    optimizer = create_optimizer(model, config)
+    scheduler = create_lr_scheduler(optimizer, config)    # [G2] currently None
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -317,9 +321,9 @@ def sup_train(args, config, model, device, loaders, num_nodes_list):
 
     # move the model to the defined device
     try:
-        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model), map_location=device))  
+        model.load_state_dict(torch.load(r'./res/saved_models/best_model_{}_{}_{}.pkl'.format(args.geo_node, args.data, args.model), map_location=device))
     except:
-        print('No trained models') 
+        print('No trained models')
     model = model.to(device)
 
     # start the training
