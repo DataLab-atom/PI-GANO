@@ -3,4 +3,7 @@
 res/
 data/
 configs/GANO_mixed_plate_stress_DG.yaml
-Mixed_data_training.pyscripts/__pycache__/
+Mixed_data_training.py
+scripts/__pycache__/
+**/__pycache__/
+*.pyc
