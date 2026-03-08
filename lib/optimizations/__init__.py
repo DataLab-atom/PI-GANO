@@ -21,6 +21,7 @@ from . import D_coordinate_encoder
 from . import E_operator_decoder
 from . import F_physics_loss
 from . import G_sampling_optimization
+from .registry import get_optimizable_functions_info, replace_and_evaluate
 
 __all__ = [
     "A_data_preprocessing",
@@ -30,4 +31,6 @@ __all__ = [
     "E_operator_decoder",
     "F_physics_loss",
     "G_sampling_optimization",
+    "get_optimizable_functions_info",
+    "replace_and_evaluate",
 ]
