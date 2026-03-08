@@ -362,11 +362,8 @@ def sup_train(args, config, model, device, loaders, num_nodes_list):
                     par = par.float().to(device)
                     par_flag = par_flag.float().to(device)
 
-                    # prepare the shape coordinate input
-                    if args.geo_node == 'vary_bound_sup':
-                        ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_bc_nodes)
-                    if args.geo_node == 'all_domain':
-                        ss_index = np.arange(0, max_pde_nodes + max_bc_nodes)
+                    # prepare the shape coordinate input [G5: get_geo_node_index]
+                    ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_bc_nodes)
                     shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
                     shape_flag = flag[:, ss_index]
                     shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)

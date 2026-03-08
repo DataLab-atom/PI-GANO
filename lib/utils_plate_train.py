@@ -403,9 +403,9 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
     pbar = range(config['train']['epochs'])
     pbar = tqdm(pbar, dynamic_ncols=True, smoothing=0.1)
 
-    # define optimizer and loss
+    # define optimizer and loss [G3: create_optimizer]
     mse = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=config['train']['base_lr'])
+    optimizer = create_optimizer(model, config)    # [G3]
 
     # visual frequency
     vf = config['train']['visual_freq']
@@ -460,13 +460,8 @@ def sup_train(args, config, model, device, loaders, num_nodes_list, params):
                     u_gt = u.float().to(device) 
                     v_gt = v.float().to(device)
 
-                    # extract the boundary of the varying shape
-                    if args.geo_node == 'vary_bound_sup':
-                        ss_index = np.arange(max_pde_nodes + max_par_nodes + max_bcy_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-                    if args.geo_node == 'all_bound':
-                        ss_index = np.arange(max_pde_nodes, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
-                    if args.geo_node == 'all_domain':
-                        ss_index = np.arange(0, max_pde_nodes + max_par_nodes + max_bcy_nodes + max_bcxy_nodes)
+                    # extract the boundary of the varying shape [G5: get_geo_node_index]
+                    ss_index = get_geo_node_index(args.geo_node, max_pde_nodes, max_par_nodes, max_bcy_nodes, max_bcxy_nodes)
                     shape_coor = coors[:, ss_index, :].float().to(device)    # (B, max_bcxy, 2)
                     shape_flag = flag[:, ss_index]
                     shape_flag = shape_flag.float().to(device)    # (B, max_bcxy)
