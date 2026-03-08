@@ -4,3 +4,6 @@ res/
 data/
 configs/GANO_mixed_plate_stress_DG.yaml
 Mixed_data_training.py
+__pycache__/
+*.pyc
+lib/optimizations/_backups/
