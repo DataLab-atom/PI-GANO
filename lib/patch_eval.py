@@ -1,37 +1,26 @@
-"""
-patch_eval.py
-
-用法:
-    from lib.patch_eval import patch_and_eval
-
-    def my_pooling(enc, shape_flag):
-        # enc: (B, M, F)   shape_flag: (B, M)
-        # 返回: (B, 1, F)
-        return (enc * shape_flag.unsqueeze(-1)).amax(1, keepdim=True)
-
-    metric = patch_and_eval(model, val_fn, my_pooling)
-"""
-
-
-def patch_and_eval(model, val_fn, new_pooling_fn):
+def patch_and_eval(val_fn, target, attr, new_value):
     """
+    把 target.attr 临时替换为 new_value，调用 val_fn()，然后还原。
+
     Args:
-        model:          PI_GANO 实例
-        val_fn:         () -> metric，你的验证函数，无参调用
-        new_pooling_fn: (enc, shape_flag) -> Domain_enc
-                        enc: (B,M,F), shape_flag: (B,M), 返回 (B,1,F)
+        val_fn:    () -> metric
+        target:    任意对象，比如 model.DG、model、model.branch
+        attr:      属性名字符串，比如 "forward"、"branch"、"encoder"
+        new_value: 替换值，nn.Module 或函数均可
+
     Returns:
         val_fn() 的返回值
+
+    Examples:
+        # 替换 pooling（forward 级别）
+        patch_and_eval(val_fn, model.DG, "forward", my_forward)
+
+        # 替换子模块（attribute 级别）
+        patch_and_eval(val_fn, model.DG, "branch", my_branch_module)
     """
-    dg = model.DG
-    original_forward = dg.forward
-
-    def patched_forward(shape_coor, shape_flag):
-        enc = dg.branch(shape_coor)               # (B, M, F)
-        return new_pooling_fn(enc, shape_flag)    # (B, 1, F)
-
-    dg.forward = patched_forward
+    old = getattr(target, attr)
+    setattr(target, attr, new_value)
     try:
         return val_fn()
     finally:
-        dg.forward = original_forward
+        setattr(target, attr, old)
