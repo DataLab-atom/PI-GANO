@@ -527,6 +527,7 @@ def _quick_eval(
     function_name: str,
     module_name: str,
     eval_config: Optional[Dict[str, Any]],
+    new_fn: Any = None,
 ) -> Dict[str, Any]:
     """
     轻量性能评估：
@@ -535,6 +536,20 @@ def _quick_eval(
         记录耗时与返回值摘要。
       - 若 eval_config['mode']=='training_eval'，触发完整的 val() 评估，
         需要 eval_config 中提供 'loader'、'model'、'device'、'args'、'num_nodes_list'。
+
+    参数:
+        new_fn: 替换后的新函数对象。仅在 training_eval 模式下 + eval_config 包含
+                'monkey_patch' 时生效，用于临时注入原始框架模块再评估。
+
+    eval_config['monkey_patch'] 格式（可选）：
+        {
+            "module": "lib.utils_losses",   # 要注入的原始模块（点分路径）
+            "attr":   "plate_stress_loss",  # 该模块中要被替换的属性名
+        }
+        评估完毕后自动恢复原函数，不会永久修改原始框架。
+        注意：val() 只测量模型预测的 L2 误差。若注入的函数不在 val() 调用链中
+        （例如仅用于 training loss），则 val_L2_relative 不会改变——
+        这是预期行为，建议改用 'call_test' 模式直接测试函数输出。
     """
     if eval_config is None or eval_config.get("mode") == "import_only":
         return {
@@ -618,19 +633,44 @@ def _quick_eval(
             num_nodes_list = eval_config["num_nodes_list"]
             problem        = eval_config.get("problem", "darcy")  # "darcy" | "plate"
 
-            t0 = time.perf_counter()
-            if problem == "darcy":
-                # 动态导入，避免顶层循环依赖
-                _train_mod = importlib.import_module("lib.utils_darcy_train")
-                val_err = _train_mod.val(model, loader, device, args_ns, num_nodes_list)
-            else:
-                _train_mod = importlib.import_module("lib.utils_plate_train")
-                val_err = _train_mod.val(model, loader, args_ns, device, num_nodes_list)
-            elapsed = time.perf_counter() - t0
+            # ── monkey-patch：将新函数临时注入原始框架模块 ──────────────────
+            _patch_restore: Optional[tuple] = None  # (module_obj, attr_name, original_fn)
+            mp = eval_config.get("monkey_patch")
+            if mp and new_fn is not None:
+                mp_mod_name = mp.get("module")
+                mp_attr     = mp.get("attr")
+                if mp_mod_name and mp_attr:
+                    mp_mod = importlib.import_module(mp_mod_name)
+                    original_fn = getattr(mp_mod, mp_attr, None)
+                    setattr(mp_mod, mp_attr, new_fn)
+                    _patch_restore = (mp_mod, mp_attr, original_fn)
 
+            try:
+                t0 = time.perf_counter()
+                if problem == "darcy":
+                    _train_mod = importlib.import_module("lib.utils_darcy_train")
+                    val_err = _train_mod.val(model, loader, device, args_ns, num_nodes_list)
+                else:
+                    _train_mod = importlib.import_module("lib.utils_plate_train")
+                    val_err = _train_mod.val(model, loader, args_ns, device, num_nodes_list)
+                elapsed = time.perf_counter() - t0
+            finally:
+                # 无论成功与否，都恢复原函数，保证不污染原始框架
+                if _patch_restore is not None:
+                    mp_mod, mp_attr, original_fn = _patch_restore
+                    if original_fn is not None:
+                        setattr(mp_mod, mp_attr, original_fn)
+                    else:
+                        try:
+                            delattr(mp_mod, mp_attr)
+                        except AttributeError:
+                            pass
+
+            monkey_patched = _patch_restore is not None
             val_err_scalar = float(val_err) if hasattr(val_err, "__float__") else None
             return {
                 "mode": "training_eval",
+                "monkey_patched": monkey_patched,
                 "val_L2_relative": val_err_scalar,
                 "pde_loss": None,
                 "bc_loss": None,
@@ -641,6 +681,7 @@ def _quick_eval(
         except Exception:
             return {
                 "mode": "training_eval",
+                "monkey_patched": False,
                 "val_L2_relative": None,
                 "pde_loss": None,
                 "bc_loss": None,
@@ -741,12 +782,15 @@ def replace_and_evaluate(
             }
 
         重要说明：
-          - "training_eval" 模式评估的是整个原始模型（model_darcy.py 等），
-            lib/optimizations/ 里的函数当前尚未插入模型 forward 流程。
-            因此除非已将此优化函数接入模型，否则 delta.val_L2_relative == 0，
-            baseline == performance，这是正确行为而非 bug。
-          - "call_test" 模式直接调用替换后的函数，delta 反映单次调用耗时变化，
-            是最直接衡量被替换函数本身性能的模式。
+          - "training_eval" 模式默认不跑基线（include_baseline=False），
+            直接评估替换后的函数在原始框架中的效果。
+          - eval_config['monkey_patch'] = {"module": "lib.utils_losses", "attr": "plate_stress_loss"}
+            可指定把新函数临时注入哪个原始模块，评估后自动恢复，不永久修改原始框架。
+          - val() 只测 L2 预测误差，与 training loss 函数无直接关系——
+            training loss 类优化（F 类）的效果需在训练后对比 val L2 才能体现，
+            建议对这类函数用 call_test 验证输出正确性，用 training_eval 验证模型集成。
+          - "call_test" 模式最直接：直接调用新函数并记录耗时与返回值，
+            是验证算法逻辑正确性的首选模式。
 
     Raises:
         ValueError: 若 target 无法解析为已知优化函数。
@@ -834,12 +878,13 @@ def replace_and_evaluate(
             },
         }
 
-    # ── 3. 备份原文件，并在替换前跑一次基线评估 ──────────────────────────────
+    # ── 3. 备份原文件 ──────────────────────────────────────────────────────────
     backup_path = _backup_file(file_path)
 
-    # 基线评估：此时文件内容仍为原始实现（含 NotImplementedError 存根）
-    # call_test / training_eval 模式下均先测原始函数行为作为对照
-    baseline_perf = _quick_eval(func_name, module_name, eval_config)
+    # 基线评估（可选）：eval_config['include_baseline']=True 时才在替换前跑一次
+    # 默认关闭以节省计算；training_eval 模式下注意 monkey_patch 在基线时不注入
+    include_baseline = bool(eval_config.get("include_baseline", False)) if eval_config else False
+    baseline_perf = _quick_eval(func_name, module_name, eval_config) if include_baseline else None
 
     # ── 4. 替换函数 ────────────────────────────────────────────────────────────
     try:
@@ -909,21 +954,27 @@ def replace_and_evaluate(
             "performance_delta": None,
         }
 
-    # ── 6. 替换后性能评估，并与基线做差 ──────────────────────────────────────
-    perf = _quick_eval(func_name, module_name, eval_config)
+    # ── 6. 获取替换后的新函数对象（用于 monkey-patch 注入原始框架） ──────────
+    full_opt_module = f"lib.optimizations.{module_name}"
+    _reloaded_mod = sys.modules.get(full_opt_module)
+    new_fn = getattr(_reloaded_mod, func_name, None) if _reloaded_mod else None
 
-    # 计算 val_L2_relative 的 delta（负值 = 改善；正值 = 退化）
+    # ── 7. 替换后性能评估（若指定 monkey_patch，自动临时注入原始模块） ────────
+    perf = _quick_eval(func_name, module_name, eval_config, new_fn=new_fn)
+
+    # 计算 delta（仅在有基线时才有意义；负值 = 改善）
     delta_val_L2 = None
-    b_val = baseline_perf.get("val_L2_relative")
-    n_val = perf.get("val_L2_relative")
-    if b_val is not None and n_val is not None:
-        delta_val_L2 = round(n_val - b_val, 8)
+    delta_time    = None
+    if baseline_perf is not None:
+        b_val = baseline_perf.get("val_L2_relative")
+        n_val = perf.get("val_L2_relative")
+        if b_val is not None and n_val is not None:
+            delta_val_L2 = round(n_val - b_val, 8)
 
-    delta_time = None
-    b_t = baseline_perf.get("call_time_seconds")
-    n_t = perf.get("call_time_seconds")
-    if b_t is not None and n_t is not None:
-        delta_time = round(n_t - b_t, 8)
+        b_t = baseline_perf.get("call_time_seconds")
+        n_t = perf.get("call_time_seconds")
+        if b_t is not None and n_t is not None:
+            delta_time = round(n_t - b_t, 8)
 
     return {
         "success": True,
@@ -940,17 +991,18 @@ def replace_and_evaluate(
             "is_implemented": not validation.get("is_stub", True),
             "error": None,
         },
-        "baseline_performance": baseline_perf,
+        "baseline_performance": baseline_perf,   # None 若 include_baseline=False
         "performance": perf,
         "performance_delta": {
-            "val_L2_relative": delta_val_L2,
+            "val_L2_relative": delta_val_L2,      # None 若无基线
             "call_time_seconds": delta_time,
             "note": (
                 "负值表示改善（误差降低/速度提升）。"
-                " training_eval 模式下 delta=0 意味着被替换的函数尚未插入原始模型"
-                "（model_darcy.py/model_plate.py），整体性能不受影响——"
-                "需先将此优化函数接入模型 forward 才能观察到有意义的 delta。"
-                " call_test 模式下 delta 反映单次函数调用耗时变化。"
+                " training_eval + monkey_patch 可将新函数临时注入原始框架后再评估——"
+                "但 val() 只测 L2 预测误差，若注入函数不在 val() 调用链中"
+                "（如 training loss 函数），val_L2_relative 不会变化，"
+                "建议改用 call_test 模式直接验证函数输出。"
+                " include_baseline=True 可启用基线对比。"
             ),
         },
     }
