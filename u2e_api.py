@@ -6,6 +6,12 @@ u2e_api.py
     get_funcs()       → list[dict]   返回所有可优化函数的元数据 + 源码
     evaluate_funcs()  → list[dict]   注入修改后的函数并运行训练，返回评估指标
 
+并发安全性
+----------
+evaluate_funcs() 使用隔离临时目录（每次调用独立复制 lib/ + configs/ + 训练脚本），
+通过子进程运行 run_experiment.py，多次并发调用互不影响，可配合
+ThreadPoolExecutor 等并发机制使用。
+
 用法（在 U2E 侧）：
     import sys
     sys.path.insert(0, "/path/to/PI-GANO")
@@ -21,7 +27,12 @@ u2e_api.py
 from __future__ import annotations
 
 import ast
+import json
+import shutil
+import subprocess
 import sys
+import tempfile
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -29,6 +40,10 @@ from typing import Optional
 
 _ROOT    = Path(__file__).parent
 _LIB_DIR = _ROOT / "lib"
+
+# 需要复制到隔离目录的子目录和文件（均为纯代码，无大型数据文件）
+_COPY_DIRS  = ["lib", "configs", "scripts"]
+_COPY_GLOBS = ["*.py"]          # 根目录下的训练脚本
 
 # ── 内部工具 ──────────────────────────────────────────────────────────────────
 
@@ -60,6 +75,55 @@ def _parse_file_metadata(path: Path) -> list[dict]:
     return results
 
 
+def _patch_source(source: str, func_name: str, new_code: str) -> str:
+    """将 source 中 func_name 函数的实现替换为 new_code，返回新 source。"""
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == func_name:
+            start, end = node.lineno, node.end_lineno
+            new_code = textwrap.dedent(new_code).strip() + "\n"
+            lines = source.splitlines(keepends=True)
+            return "".join(lines[: start - 1]) + new_code + "\n" + "".join(lines[end:])
+    raise ValueError(f"函数 '{func_name}' 未找到")
+
+
+def _build_isolated_workdir(replacements: list[dict]) -> Path:
+    """
+    创建一个隔离的临时工程目录，其中已应用 replacements 补丁。
+
+    复制内容（轻量，纯代码）：
+        lib/        – 含 *_optimizable.py（被补丁的目标）
+        configs/    – YAML 训练配置
+        scripts/    – run_experiment.py 等工具脚本
+        *.py        – 根目录训练入口脚本
+
+    Returns:
+        Path: 临时目录路径（调用方负责在使用后删除）
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="pi_gano_eval_"))
+
+    # 复制代码目录
+    for d in _COPY_DIRS:
+        src = _ROOT / d
+        if src.exists():
+            shutil.copytree(src, tmp / d)
+
+    # 复制根目录 *.py
+    for pattern in _COPY_GLOBS:
+        for f in _ROOT.glob(pattern):
+            shutil.copy2(f, tmp / f.name)
+
+    # 应用补丁（在临时副本的 lib/ 中修改）
+    tmp_lib = tmp / "lib"
+    for rep in replacements:
+        fpath   = tmp_lib / rep["file"]
+        current = fpath.read_text(encoding="utf-8")
+        patched = _patch_source(current, rep["function"], rep["code"])
+        fpath.write_text(patched, encoding="utf-8")
+
+    return tmp
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  公开 API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -78,14 +142,13 @@ def get_funcs() -> list[dict]:
         }
 
     Returns:
-        list[dict]: 所有可优化函数的信息列表，按文件名 + 函数在文件中的出现顺序排列。
+        list[dict]: 所有可优化函数的信息列表，按文件名 + 出现顺序排列。
     """
     items = []
     for py_file in sorted(_LIB_DIR.glob("*_optimizable.py")):
         for meta in _parse_file_metadata(py_file):
             func_source = _extract_func_source(py_file, meta["func_name"])
             doc         = meta["docstring"]
-            # 取 docstring 第一个非空行作为简短描述
             first_line  = next(
                 (l.strip() for l in doc.splitlines() if l.strip()), meta["func_name"]
             )
@@ -104,7 +167,10 @@ def evaluate_funcs(
     epochs: Optional[int] = None,
 ) -> list[dict]:
     """
-    接收 U2E 传入的函数列表，将其中被修改的函数注入 PI-GANO 并运行训练评估。
+    接收 U2E 传入的函数列表，在隔离的临时目录中运行 PI-GANO 训练评估。
+
+    并发安全：每次调用均在独立的临时工程副本中执行，多个并发调用互不干扰，
+    可配合 concurrent.futures.ThreadPoolExecutor 使用。
 
     Args:
         func_list: U2E 提供的函数列表，每个元素至少包含：
@@ -126,9 +192,8 @@ def evaluate_funcs(
             }
 
     Raises:
-        ValueError: 若没有任何函数被修改（is_modified=True），则无需评估，
-                    抛出 ValueError 提示调用方。
-        RuntimeError: run_experiment 内部失败（文件已自动还原）。
+        ValueError: 若 func_list 中没有任何 is_modified=True 的函数。
+        RuntimeError: 临时目录创建或补丁应用失败。
     """
     # 只处理被修改的函数
     replacements = []
@@ -152,16 +217,42 @@ def evaluate_funcs(
             "func_list 中没有任何 is_modified=True 的函数，无需运行实验。"
         )
 
-    # 延迟导入，避免在仅调用 get_funcs() 时加载 torch 等重量级依赖
-    from scripts.run_experiment import run_experiment
+    # 创建隔离临时工程目录（含补丁），用完即删
+    tmp_dir = _build_isolated_workdir(replacements)
+    try:
+        # 将替换规格写入临时目录内的 spec.json
+        spec_path    = tmp_dir / "spec.json"
+        results_path = tmp_dir / "results.json"
+        spec_path.write_text(
+            json.dumps(replacements, ensure_ascii=False), encoding="utf-8"
+        )
 
-    results = run_experiment(replacements, epochs=epochs)
+        # 通过子进程运行临时目录内的 run_experiment.py
+        # 每个并发调用拥有独立的 cwd 和独立的 lib/，完全隔离
+        cmd = [
+            sys.executable,
+            str(tmp_dir / "scripts" / "run_experiment.py"),
+            "--spec",   str(spec_path),
+            "--out",    str(results_path),
+            "--no-stdout",
+        ]
+        if epochs is not None:
+            cmd += ["--epochs", str(epochs)]
 
-    # 将 PI-GANO 的结果格式转换为 U2E 的 evaluate_funcs 返回格式
+        subprocess.run(cmd, cwd=str(tmp_dir), check=False)
+
+        # 读取结果
+        if not results_path.exists():
+            raise RuntimeError("run_experiment.py 未生成结果文件，训练可能崩溃。")
+        raw: dict = json.loads(results_path.read_text(encoding="utf-8"))
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # 转换为 U2E evaluate_funcs 返回格式
     metrics: list[dict] = []
-    for problem, scores in results.items():
+    for problem, scores in raw.items():
         if scores.get("returncode", 1) != 0:
-            # 训练失败：返回极大值作为惩罚
             metrics.append({
                 "name":      f"{problem}_test_L2",
                 "value":     float("inf"),
