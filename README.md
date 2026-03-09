@@ -49,6 +49,71 @@ python PINO_plate_training.py --model='self_defined' --phase='train'
 
 If you are interested in developing more advanced training algorithms, please check our the script "utils_darcy_train.py" and "utils_plate_train.py".
 
+## LLM-Driven Architecture Optimization (ReEvo2D)
+
+PI-GANO integrates [ReEvo2D](https://github.com/DataLab-atom/open-agents-U2E) — a large language model-based evolutionary optimizer — to automatically search for better implementations of the key internal functions defined in `lib/*_optimizable.py`. The optimizer iteratively proposes, evaluates, and reflects on function variants, guided by training metrics on the Darcy and plate problems.
+
+### Repository Structure
+
+```
+PI-GANO/
+├── main.py                    # One-command launch entry
+├── u2e_api.py                 # get_funcs / evaluate_funcs (concurrency-safe)
+├── optimizer/                 # ReEvo2D algorithm package
+│   ├── reevo2d.py             # Evolutionary main loop
+│   └── utils/
+│       ├── utils.py           # Helper utilities
+│       └── llm_client/        # OpenAI / LlamaAPI / ZhipuAI clients
+├── prompts/common/            # LLM prompt templates
+├── lib/                       # Optimizable function definitions (*_optimizable.py)
+├── configs/                   # Training configuration YAML files
+└── scripts/run_experiment.py  # Training experiment executor
+```
+
+### Quick Start
+
+Install dependencies first:
+```bash
+pip install -r requirements.txt
+```
+
+Then launch the optimizer:
+```bash
+# Minimal launch (API key via environment variable)
+export OPENAI_API_KEY=your_key_here
+python main.py --model deepseek-coder
+
+# Full options
+python main.py \
+    --model         deepseek-coder \
+    --api-key       $OPENAI_API_KEY \
+    --base-url      https://api.example.com/v1 \
+    --temperature   0.5 \
+    --max-fe        500 \
+    --pop-size      20 \
+    --init-pop-size 50 \
+    --mutation-rate 0.8 \
+    --epochs        50 \
+    --output-dir    ./runs/exp1
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `--model` | `deepseek-coder` | LLM model name |
+| `--api-key` | env `OPENAI_API_KEY` | LLM API key |
+| `--base-url` | env `OPENAI_BASE_URL` | API base URL (for proxies / alternative providers) |
+| `--temperature` | `0.5` | LLM sampling temperature |
+| `--max-fe` | `500` | Max function evaluations (stopping criterion) |
+| `--pop-size` | `20` | Population size per generation |
+| `--init-pop-size` | `50` | Initial population size |
+| `--mutation-rate` | `0.8` | Mutation rate |
+| `--epochs` | config default | Training epochs per evaluation (overrides `configs/*.yaml`) |
+| `--output-dir` | `./runs/pi_gano_reevo` | Output directory for results and logs |
+
+Results are written to `--output-dir/problems/pi_gano/`. The best-found function implementations are logged at the end of the run.
+
+---
+
 ## Optimization & Experiment Scripts
 
 Two utility scripts are provided under `scripts/` to support systematic architecture optimization.
