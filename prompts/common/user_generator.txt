@@ -1,0 +1,9 @@
+There is a Markdown document that contains Python code along with relevant explanations. A target function `{func_name}` has been selected from this document.
+Write a new `{func_name}` for problem:
+{problem_desc}
+
+Function description:
+{func_desc}
+
+markdown document:
+{doc}
